@@ -926,9 +926,9 @@ class BuildCommand extends Command {
 
     final splitDir = join(current, "build", "app", "outputs", "flutter-apk");
     final archMap = {
-      "app-arm64-v8a-release.apk": "${Build.appName}-android-arm64-v8a.apk",
-      "app-armeabi-v7a-release.apk": "${Build.appName}-android-armeabi-v7a.apk",
-      "app-x86_64-release.apk": "${Build.appName}-android-x86_64.apk",
+      "app-arm64-v8a-release.apk": "vnxMATRIX-android-arm64-v8a.apk",
+      "app-armeabi-v7a-release.apk": "vnxMATRIX-android-armeabi-v7a.apk",
+      "app-x86_64-release.apk": "vnxMATRIX-android-x86_64.apk",
     };
     for (final f in Directory(splitDir).listSync()) {
       final name = basename(f.path);
@@ -948,7 +948,7 @@ class BuildCommand extends Command {
     );
     Build.copyFile(
       join(splitDir, "app-release.apk"),
-      join(Build.distPath, "${Build.appName}-android-universal.apk"),
+      join(Build.distPath, "vnxMATRIX-android-universal.apk"),
     );
     print("✅ APKs created in ${Build.distPath}");
   }
