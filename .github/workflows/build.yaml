@@ -10,32 +10,62 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  # Состав платформ собирается здесь, чтобы сборку macOS можно было включать
+  # переменной репозитория, не правя YAML.
+  #
+  # Переменная BUILD_MACOS: Settings → Secrets and variables → Actions →
+  # вкладка Variables. Значение 'true' включает macOS, любое другое или
+  # отсутствие — выключает, и раннер macOS не расходуется вовсе.
+  #
+  # Выключено потому, что подпись и нотаризация требуют Apple Developer
+  # Program: секреты APPLE_CERTIFICATE, APPLE_TEAM_ID, APPLE_API_KEY_BASE64 и
+  # остальные. Пока их нет, шаг подписи падает, из-за чего вся матрица
+  # получает статус failure — а задача upload запускается только при
+  # needs.build.result == 'success' и релиз не публикуется.
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.value }}
+      build-macos: ${{ steps.matrix.outputs.macos }}
+    steps:
+      - name: Resolve platform matrix
+        id: matrix
+        env:
+          BUILD_MACOS: ${{ vars.BUILD_MACOS }}
+        run: |
+          base='[
+            {"platform":"android","os":"ubuntu-latest"},
+            {"platform":"windows","os":"windows-latest","arch":"amd64"},
+            {"platform":"windows","os":"windows-11-arm","arch":"arm64"},
+            {"platform":"linux","os":"ubuntu-24.04","arch":"amd64"},
+            {"platform":"linux","os":"ubuntu-24.04-arm","arch":"arm64"}
+          ]'
+          mac='[
+            {"platform":"macos","os":"macos-latest","arch":"amd64"},
+            {"platform":"macos","os":"macos-latest","arch":"arm64"}
+          ]'
+
+          # Регистр не важен: 'true', 'True' и 'TRUE' включают сборку одинаково.
+          if [ "$(printf '%s' "$BUILD_MACOS" | tr '[:upper:]' '[:lower:]')" = "true" ]; then
+            echo "macos=true" >> "$GITHUB_OUTPUT"
+            echo "value=$(jq -cn --argjson a "$base" --argjson b "$mac" '$a + $b')" >> "$GITHUB_OUTPUT"
+            echo "::notice title=macOS::Сборка macOS включена переменной BUILD_MACOS."
+          else
+            echo "macos=false" >> "$GITHUB_OUTPUT"
+            echo "value=$(jq -cn --argjson a "$base" '$a')" >> "$GITHUB_OUTPUT"
+            echo "::notice title=macOS::Сборка macOS пропущена: переменная BUILD_MACOS не равна 'true'."
+          fi
+
+      - name: Show resolved matrix
+        run: echo '${{ steps.matrix.outputs.value }}' | jq .
+
   build:
+    needs: [prepare]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - platform: android
-            os: ubuntu-latest
-          - platform: windows
-            os: windows-latest
-            arch: amd64
-          - platform: linux
-            os: ubuntu-24.04
-            arch: amd64
-          - platform: macos
-            os: macos-latest
-            arch: amd64
-          - platform: macos
-            os: macos-latest
-            arch: arm64
-          - platform: windows
-            os: windows-11-arm
-            arch: arm64
-          - platform: linux
-            os: ubuntu-24.04-arm
-            arch: arm64
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
 
     steps:
       - name: Setup Rust for Windows ARM64
@@ -176,8 +206,8 @@ jobs:
           fi
 
   sign-macos:
-    needs: [build]
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [prepare, build]
+    if: needs.prepare.outputs.build-macos == 'true' && startsWith(github.ref, 'refs/tags/v')
     strategy:
       matrix:
         include:
@@ -263,7 +293,9 @@ jobs:
 
   upload:
     permissions: write-all
-    needs: [build, sign-macos]
+    needs: [prepare, build, sign-macos]
+    # sign-macos пропускается при выключенном флаге, поэтому always() здесь
+    # обязателен: без него релиз не собрался бы из-за пропущенной зависимости.
     if: always() && (needs.build.result == 'success')
     runs-on: ubuntu-latest
     steps:
@@ -280,7 +312,7 @@ jobs:
           merge-multiple: true
 
       - name: Download signed macOS artifacts
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: needs.prepare.outputs.build-macos == 'true' && startsWith(github.ref, 'refs/tags/v')
         uses: actions/download-artifact@v6
         with:
           path: ./dist/
