@@ -1,0 +1,283 @@
+name: android-release
+
+# Сборка Android для Google Play и для ручной раздачи.
+#
+# Почему отдельный workflow, а не build.yaml: build.yaml собирает все платформы
+# одной матрицей и публикует релиз, только если не упала ни одна ветка. Любая
+# недостроенная платформа (macOS без Apple Developer, Windows ARM) блокировала
+# выпуск APK. Здесь Android изолирован: ничего, кроме него, релиз не держит.
+#
+# Запуск:
+#   • вручную: Actions → android-release → Run workflow;
+#   • автоматически: пуш в ветку release/** (тег не нужен — токен сессии теги
+#     пушить не может).
+#
+# Что получается на выходе (вкладка запуска → Artifacts):
+#   • vnxMATRIX-play.aab        — загружать в Google Play Console;
+#   • vnxMATRIX-android-*.apk   — для ручной раздачи тестерам;
+#   • отпечаток ключа подписи в сводке запуска — сверять с Play Console.
+
+on:
+  workflow_dispatch:
+    inputs:
+      allow_debug_signing:
+        description: "Разрешить сборку без релизного ключа (debug-подпись). Play такой AAB отклонит"
+        type: boolean
+        default: false
+      upload_to_play:
+        description: "Отправить AAB в Google Play (трек internal). Нужен секрет PLAY_SERVICE_ACCOUNT_JSON"
+        type: boolean
+        default: false
+  push:
+    # release/** — боевые сборки, ключ подписи обязателен.
+    # claude/vnxmatrix-rebrand-v2-* — рабочая ветка: сборка проверяет, что
+    # конвейер жив, и допускает debug-ключ (артефакт помечается DEBUGKEY).
+    branches: ["release/**", "claude/vnxmatrix-rebrand-v2-*"]
+    paths-ignore: ["docs/**", "**/*.md"]
+
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Менять нельзя: после публикации в Play applicationId не меняется никогда.
+  EXPECTED_APPLICATION_ID: com.vnxmatrix.client
+
+jobs:
+  # ── Инварианты проекта: дешёвые проверки того, что ломать нельзя ───────────
+  guard:
+    name: Project invariants
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: applicationId не изменился
+        run: |
+          grep -q "applicationId = \"${EXPECTED_APPLICATION_ID}\"" android/app/build.gradle.kts || {
+            echo "::error::applicationId в android/app/build.gradle.kts не равен ${EXPECTED_APPLICATION_ID}. После публикации в Play он не меняется никогда."
+            exit 1
+          }
+          echo "✓ applicationId = ${EXPECTED_APPLICATION_ID}"
+
+      - name: User-Agent начинается с FlClash
+        run: |
+          # По User-Agent панель выбирает формат подписки (правило Mihomo
+          # ловит ^flclash). Сменишь строку — приложение получит base64 вместо
+          # YAML и сломается у всех клиентов сразу.
+          grep -q '"FlClash X/v' lib/common/package.dart || {
+            echo "::error::User-Agent в lib/common/package.dart больше не начинается с 'FlClash X/v'. Панель перестанет отдавать этому приложению YAML."
+            exit 1
+          }
+          echo "✓ User-Agent совместим с правилами панели"
+
+      - name: Нет секретов в коде
+        run: |
+          patterns='[0-9]{8,10}:AA[A-Za-z0-9_-]{33}|gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,}|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+          if git grep -nIE "$patterns" > /tmp/hits.txt; then
+            echo "::error::Похоже на секрет в коде. Значения не печатаем — только места:"
+            cut -d: -f1,2 /tmp/hits.txt
+            exit 1
+          fi
+          echo "✓ секретов не найдено"
+
+      - name: keystore не закоммичен
+        run: |
+          if git ls-files | grep -E '\.(jks|keystore|p12)$'; then
+            echo "::error::В репозитории лежит файл ключа подписи. Его нужно удалить из истории и пересоздать ключ."
+            exit 1
+          fi
+          echo "✓ файлов ключей в репозитории нет"
+
+  # ── Сборка ─────────────────────────────────────────────────────────────────
+  build:
+    name: Build AAB + APK
+    needs: [guard]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      KEYSTORE_B64: ${{ secrets.KEYSTORE }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+      STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+      GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Проверить наличие ключа подписи
+        id: signing
+        env:
+          # На рабочей ветке пуш допускает debug-ключ без вопросов. На release/**
+          # и при ручном запуске — только если явно включён allow_debug_signing.
+          ALLOW_DEBUG: ${{ (github.event_name == 'push' && !startsWith(github.ref, 'refs/heads/release/')) || inputs.allow_debug_signing }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ] && [ -n "$KEY_ALIAS" ] && [ -n "$STORE_PASSWORD" ] && [ -n "$KEY_PASSWORD" ]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "✓ найдены все четыре секрета подписи"
+          elif [ "$ALLOW_DEBUG" = "true" ]; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Секретов подписи нет, сборка пойдёт с DEBUG-ключом. Google Play такой AAB не примет."
+          else
+            echo "::error::Нет секретов подписи. Нужны KEYSTORE (base64), KEY_ALIAS, STORE_PASSWORD, KEY_PASSWORD — Settings → Secrets and variables → Actions. Для пробной сборки без ключа запустите вручную с allow_debug_signing=true."
+            exit 1
+          fi
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.0"
+          cache-dependency-path: core/go.sum
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.41.7"
+          cache: true
+
+      - run: flutter --version
+
+      - name: Зависимости Flutter
+        run: flutter pub get
+
+      - name: Подпись релизным ключом
+        if: steps.signing.outputs.release == 'true'
+        run: |
+          # Gradle берёт ключ из android/app/keystore.jks и параметры из
+          # android/local.properties (см. android/app/build.gradle.kts).
+          # Значения пишутся через printf '%s', чтобы спецсимволы не
+          # интерпретировались. Пароли лучше делать из букв и цифр:
+          # формат .properties трактует обратную косую черту особо.
+          printf '%s' "$KEYSTORE_B64" | base64 --decode > android/app/keystore.jks
+          {
+            printf 'keyAlias=%s\n' "$KEY_ALIAS"
+            printf 'storePassword=%s\n' "$STORE_PASSWORD"
+            printf 'keyPassword=%s\n' "$KEY_PASSWORD"
+          } >> android/local.properties
+          echo "✓ релизный ключ подключён"
+
+      - name: Firebase (необязательно)
+        run: |
+          if [ -n "$GOOGLE_SERVICES_JSON" ]; then
+            printf '%s' "$GOOGLE_SERVICES_JSON" | base64 --decode > android/app/google-services.json
+            echo "✓ google-services.json подключён"
+          else
+            echo "Firebase не настроен — сборка без push-уведомлений, это штатно"
+          fi
+
+      - name: Версия сборки
+        id: version
+        run: |
+          # versionCode в Google Play обязан быть уникальным и расти с каждой
+          # загрузкой, максимум 2 100 000 000. Берём минуты с 2026-01-01 UTC:
+          # не зависит от счётчиков запусков, повторный запуск даёт новое число,
+          # к лимиту далеко (сейчас порядка полумиллиона).
+          now=$(date -u +%s)
+          epoch=$(date -u -d '2026-01-01T00:00:00Z' +%s)
+          code=$(( (now - epoch) / 60 ))
+          name=$(grep -E '^version:' pubspec.yaml | sed -E 's/version:\s*([0-9.]+).*/\1/')
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "versionName=$name versionCode=$code"
+
+      - name: Ядро (Go → .so для всех архитектур)
+        run: dart setup.dart android --env stable --out core
+
+      - name: Версия ядра
+        id: core
+        run: |
+          v=$(grep -oP 'github\.com/metacubex/mihomo\s+\Kv[\d.]+' core/go.mod | head -1)
+          [ -n "$v" ] || { echo "::error::Не удалось определить версию mihomo из core/go.mod"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Сборка AAB для Google Play
+        run: |
+          flutter build appbundle --release \
+            --build-number=${{ steps.version.outputs.code }} \
+            --dart-define=APP_ENV=stable \
+            --dart-define=CORE_VERSION=${{ steps.core.outputs.version }} \
+            --dart-define=APP_VERSION=
+
+      - name: Сборка APK для ручной раздачи
+        run: |
+          flutter build apk --release --split-per-abi \
+            --build-number=${{ steps.version.outputs.code }} \
+            --dart-define=APP_ENV=stable \
+            --dart-define=CORE_VERSION=${{ steps.core.outputs.version }} \
+            --dart-define=APP_VERSION=
+
+      - name: Проверка подписи и отпечаток
+        env:
+          IS_RELEASE: ${{ steps.signing.outputs.release }}
+        run: |
+          aab=build/app/outputs/bundle/release/app-release.aab
+          [ -f "$aab" ] || { echo "::error::AAB не собран: $aab"; exit 1; }
+
+          cert=$(keytool -printcert -jarfile "$aab" 2>&1 || true)
+          sha256=$(printf '%s\n' "$cert" | grep -m1 'SHA256:' | sed 's/^\s*//')
+          owner=$(printf '%s\n' "$cert" | grep -m1 -E '^(Owner|Владелец):' | sed 's/^\s*//')
+
+          if printf '%s' "$cert" | grep -qi 'CN=Android Debug'; then
+            if [ "$IS_RELEASE" = "true" ]; then
+              echo "::error::Секреты подписи были, но AAB подписан debug-ключом. Проверьте android/local.properties и путь к keystore.jks."
+              exit 1
+            fi
+            echo "::warning::AAB подписан DEBUG-ключом — для Google Play непригоден."
+          fi
+
+          {
+            echo "## Подпись AAB"
+            echo
+            echo "- Тип: $([ "$IS_RELEASE" = "true" ] && echo 'релизный ключ' || echo '⚠️ DEBUG, в Play не пойдёт')"
+            echo "- ${owner:-Owner: не определён}"
+            echo "- ${sha256:-SHA256: не определён}"
+            echo "- versionName: ${{ steps.version.outputs.name }}"
+            echo "- versionCode: ${{ steps.version.outputs.code }}"
+            echo "- mihomo: ${{ steps.core.outputs.version }}"
+            echo
+            echo "Отпечаток SHA256 можно сверять с Play Console → Настройка → Целостность приложения."
+            echo "Это публичный идентификатор ключа, не секрет."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Собрать артефакты
+        env:
+          IS_RELEASE: ${{ steps.signing.outputs.release }}
+        run: |
+          # Сборка с debug-ключом получает в имени метку DEBUGKEY: иначе её
+          # легко перепутать с релизной и попытаться загрузить в Play.
+          tag=$([ "$IS_RELEASE" = "true" ] && echo "" || echo "-DEBUGKEY")
+          mkdir -p dist
+          cp build/app/outputs/bundle/release/app-release.aab "dist/vnxMATRIX-play${tag}.aab"
+          for apk in build/app/outputs/flutter-apk/app-*-release.apk; do
+            abi=$(basename "$apk" | sed -E 's/app-(.*)-release\.apk/\1/')
+            cp "$apk" "dist/vnxMATRIX-android-${abi}${tag}.apk"
+          done
+          ls -la dist
+          # Файл ключа с раннера удаляется сразу: артефактом он не станет, но и
+          # на диске лежать после сборки незачем.
+          rm -f android/app/keystore.jks
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: android-release-${{ steps.version.outputs.code }}${{ steps.signing.outputs.release != 'true' && '-DEBUGKEY' || '' }}
+          path: dist/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Отправить в Google Play (internal)
+        if: inputs.upload_to_play == true && steps.signing.outputs.release == 'true'
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: com.vnxmatrix.client
+          releaseFiles: dist/vnxMATRIX-play.aab  # только релизная подпись: шаг ниже требует release=true
+          track: internal
+          # draft — безопасно для первого релиза: Play принимает файл, но не
+          # раздаёт его, пока вы не нажмёте «Начать развёртывание» в консоли.
+          status: draft
