@@ -283,6 +283,8 @@ jobs:
           serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
           packageName: com.vnxmatrix.client
           releaseFiles: dist/vnxMATRIX-play.aab  # только релизная подпись: шаг ниже требует release=true
+          # Тексты «Что нового» (до 500 символов на язык) — файлы вида whatsnew-<локаль>.
+          whatsNewDirectory: distribution/whatsnew
           track: internal
           # draft — безопасно для первого релиза: Play принимает файл, но не
           # раздаёт его, пока вы не нажмёте «Начать развёртывание» в консоли.
