@@ -146,39 +146,72 @@ jobs:
       - name: Зависимости Flutter
         run: flutter pub get
 
+      - name: Очистить значения секретов
+        if: steps.signing.outputs.release == 'true'
+        run: |
+          # Секреты, вставленные через буфер обмена, часто несут лишний перевод
+          # строки, возврат каретки или пробел. Для пароля это значит «неверный
+          # пароль», хотя на глаз он правильный. Лишнее убираем и говорим об этом.
+          clean() { printf '%s' "$1" | tr -d '\r\n' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'; }
+          a=$(clean "$KEY_ALIAS"); s=$(clean "$STORE_PASSWORD"); k=$(clean "$KEY_PASSWORD")
+          for pair in "KEY_ALIAS:$KEY_ALIAS:$a" "STORE_PASSWORD:$STORE_PASSWORD:$s" "KEY_PASSWORD:$KEY_PASSWORD:$k"; do
+            name=${pair%%:*}; rest=${pair#*:}; raw=${rest%:*}; cleaned=${rest##*:}
+            if [ "${#raw}" != "${#cleaned}" ]; then
+              echo "::warning::В секрете $name были лишние пробелы или переводы строки (${#raw} → ${#cleaned} символов). Они убраны автоматически; секрет лучше пересоздать без них."
+            fi
+          done
+          echo "длины: алиас=${#a}, пароль хранилища=${#s}, пароль ключа=${#k}"
+          echo "::add-mask::$s"
+          echo "::add-mask::$k"
+          {
+            echo "CLEAN_ALIAS=$a"
+            echo "CLEAN_STOREPW=$s"
+            echo "CLEAN_KEYPW=$k"
+          } >> "$GITHUB_ENV"
+
       - name: Подпись релизным ключом
         if: steps.signing.outputs.release == 'true'
         run: |
           # Gradle берёт ключ из android/app/keystore.jks и параметры из
           # android/local.properties (см. android/app/build.gradle.kts).
-          # Значения пишутся через printf '%s', чтобы спецсимволы не
-          # интерпретировались. Пароли лучше делать из букв и цифр:
-          # формат .properties трактует обратную косую черту особо.
-          printf '%s' "$KEYSTORE_B64" | base64 --decode > android/app/keystore.jks
+          printf '%s' "$KEYSTORE_B64" | tr -d '\r\n ' | base64 --decode > android/app/keystore.jks
+
+          # Файл, который создаёт Flutter, заканчивается БЕЗ перевода строки.
+          # Без этого первая дописанная строка приклеивалась к flutter.sdk=…, и
+          # Gradle не видел keyAlias: он молча подписывал debug-ключом.
+          printf '\n' >> android/local.properties
           {
-            printf 'keyAlias=%s\n' "$KEY_ALIAS"
-            printf 'storePassword=%s\n' "$STORE_PASSWORD"
-            printf 'keyPassword=%s\n' "$KEY_PASSWORD"
+            printf 'keyAlias=%s\n' "$CLEAN_ALIAS"
+            printf 'storePassword=%s\n' "$CLEAN_STOREPW"
+            printf 'keyPassword=%s\n' "$CLEAN_KEYPW"
           } >> android/local.properties
-          echo "✓ релизный ключ подключён"
+
+          for key in keyAlias storePassword keyPassword; do
+            grep -q "^${key}=" android/local.properties || { echo "::error::В android/local.properties нет свойства ${key}."; exit 1; }
+          done
+          echo "✓ релизный ключ подключён, свойства на месте"
 
       - name: Быстрая проверка ключа (до долгой сборки)
         if: steps.signing.outputs.release == 'true'
         run: |
-          # Падаем за минуту, а не после двенадцати минут сборки: без этой
-          # проверки неверный пароль или потерянный ключ вскрываются только на
-          # последнем шаге.
-          echo "--- ключ открывается с этими паролем и алиасом?"
-          if ! keytool -list -keystore android/app/keystore.jks -storepass "$STORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null 2>&1; then
-            echo "::error::keytool не смог открыть ключ: неверный STORE_PASSWORD или KEY_ALIAS, либо повреждён KEYSTORE."
+          # Падаем за минуту, а не после двенадцати минут сборки, и говорим, ЧТО
+          # именно не подошло: пароль или алиас.
+          ks=android/app/keystore.jks
+          if ! keytool -list -keystore "$ks" -storepass "$CLEAN_STOREPW" > /tmp/kl.txt 2>&1; then
+            echo "::error::STORE_PASSWORD не подходит к хранилищу. Файл KEYSTORE в порядке ($(wc -c < $ks) байт), значит пароль введён не тот. Проверьте, что вставлен именно пароль из Cloud Shell (32 символа, цифры и буквы a-f), без подписи «ПАРОЛЬ:»."
             exit 1
           fi
-          keytool -list -v -keystore android/app/keystore.jks -storepass "$STORE_PASSWORD" -alias "$KEY_ALIAS" 2>&1 \
-            | grep -E 'Alias name|Owner|Valid from|SHA256' || true
-
-          echo "--- какие свойства видит Gradle (только имена, значения не печатаем)"
+          echo "✓ пароль хранилища подходит"
+          echo "алиасы в хранилище:"; grep -E 'PrivateKeyEntry|trustedCertEntry' /tmp/kl.txt | cut -d, -f1 | sed 's/^/  /'
+          if ! keytool -list -keystore "$ks" -storepass "$CLEAN_STOREPW" -alias "$CLEAN_ALIAS" > /dev/null 2>&1; then
+            echo "::error::Пароль подходит, но алиаса «$CLEAN_ALIAS» в хранилище нет. KEY_ALIAS должен совпадать с одним из алиасов выше."
+            exit 1
+          fi
+          echo "✓ алиас найден"
+          keytool -list -v -keystore "$ks" -storepass "$CLEAN_STOREPW" -alias "$CLEAN_ALIAS" 2>&1 \
+            | grep -E 'Owner|Valid from|SHA256' || true
+          echo "--- свойства, которые увидит Gradle (только имена):"
           cut -d= -f1 android/local.properties | sort | tr '\n' ' '; echo
-          ls -la android/app/keystore.jks
 
       - name: Firebase (необязательно)
         run: |
