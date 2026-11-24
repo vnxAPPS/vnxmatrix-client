@@ -162,6 +162,24 @@ jobs:
           } >> android/local.properties
           echo "✓ релизный ключ подключён"
 
+      - name: Быстрая проверка ключа (до долгой сборки)
+        if: steps.signing.outputs.release == 'true'
+        run: |
+          # Падаем за минуту, а не после двенадцати минут сборки: без этой
+          # проверки неверный пароль или потерянный ключ вскрываются только на
+          # последнем шаге.
+          echo "--- ключ открывается с этими паролем и алиасом?"
+          if ! keytool -list -keystore android/app/keystore.jks -storepass "$STORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null 2>&1; then
+            echo "::error::keytool не смог открыть ключ: неверный STORE_PASSWORD или KEY_ALIAS, либо повреждён KEYSTORE."
+            exit 1
+          fi
+          keytool -list -v -keystore android/app/keystore.jks -storepass "$STORE_PASSWORD" -alias "$KEY_ALIAS" 2>&1 \
+            | grep -E 'Alias name|Owner|Valid from|SHA256' || true
+
+          echo "--- какие свойства видит Gradle (только имена, значения не печатаем)"
+          cut -d= -f1 android/local.properties | sort | tr '\n' ' '; echo
+          ls -la android/app/keystore.jks
+
       - name: Firebase (необязательно)
         run: |
           if [ -n "$GOOGLE_SERVICES_JSON" ]; then
@@ -196,6 +214,12 @@ jobs:
           [ -n "$v" ] || { echo "::error::Не удалось определить версию mihomo из core/go.mod"; exit 1; }
           echo "version=$v" >> "$GITHUB_OUTPUT"
 
+      - name: Состояние подписи перед сборкой AAB
+        if: steps.signing.outputs.release == 'true'
+        run: |
+          echo "keystore.jks: $(ls -la android/app/keystore.jks 2>&1 | awk '{print $5" байт"}')"
+          echo "свойства: $(cut -d= -f1 android/local.properties | sort | tr '\n' ' ')"
+
       - name: Сборка AAB для Google Play
         run: |
           # Все ABI. Размер AAB (~190 МБ) обманчив: около 68 МБ из них — нативные
@@ -229,6 +253,8 @@ jobs:
           sha256=$(printf '%s\n' "$cert" | grep -m1 'SHA256:' | sed 's/^\s*//')
           owner=$(printf '%s\n' "$cert" | grep -m1 -E '^(Owner|Владелец):' | sed 's/^\s*//')
 
+          echo "--- сертификат AAB:"; printf '%s\n' "$cert" | grep -E 'Owner|Владелец|SHA256|Valid|Signer|Exception|error' | head -6 || true
+
           if printf '%s' "$cert" | grep -qi 'CN=Android Debug'; then
             if [ "$IS_RELEASE" = "true" ]; then
               echo "::error::Секреты подписи были, но AAB подписан debug-ключом. Проверьте android/local.properties и путь к keystore.jks."
@@ -250,6 +276,20 @@ jobs:
             echo "Отпечаток SHA256 можно сверять с Play Console → Настройка → Целостность приложения."
             echo "Это публичный идентификатор ключа, не секрет."
           } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Диагностика подписи (только при падении)
+        if: failure() && steps.signing.outputs.release == 'true'
+        run: |
+          # gradlew создаётся Flutter при первой сборке, поэтому отчёт доступен
+          # только здесь. Показывает, какую подпись Gradle реально выбрал.
+          echo "keystore.jks: $(ls -la android/app/keystore.jks 2>&1 | awk '{print $5" байт"}')"
+          echo "свойства: $(cut -d= -f1 android/local.properties 2>&1 | sort | tr '\n' ' ')"
+          if [ -x android/gradlew ]; then
+            (cd android && ./gradlew :app:signingReport --no-daemon -q 2>&1) \
+              | grep -A4 -E '^Variant: release$' | grep -E 'Variant|Config|Store|Alias' || echo "(блок release не найден)"
+          else
+            echo "gradlew не найден"
+          fi
 
       - name: Собрать артефакты
         env:
