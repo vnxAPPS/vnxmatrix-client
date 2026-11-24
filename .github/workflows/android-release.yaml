@@ -198,11 +198,13 @@ jobs:
 
       - name: Сборка AAB для Google Play
         run: |
-          # Только arm и arm64: x86_64 встречается лишь в эмуляторах, а AAB со
-          # всеми архитектурами весил 207 МБ — слишком близко к лимитам Play.
-          # APK для ручной раздачи ниже по-прежнему собираются под все ABI.
+          # Все ABI. Размер AAB (~190 МБ) обманчив: около 68 МБ из них — нативные
+          # отладочные символы для расшифровки крэшей, пользователям Play их не
+          # отдаёт; на устройство уходит срез порядка 60 МБ.
+          # Урезать архитектуры через --target-platform НЕЛЬЗЯ: флаг убирает
+          # только движок Flutter, а Go-ядро остаётся, и в AAB получается
+          # x86_64 с ядром, но без libflutter — приложение падает при запуске.
           flutter build appbundle --release \
-            --target-platform android-arm,android-arm64 \
             --build-number=${{ steps.version.outputs.code }} \
             --dart-define=APP_ENV=stable \
             --dart-define=CORE_VERSION=${{ steps.core.outputs.version }} \
