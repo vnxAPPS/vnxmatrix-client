@@ -202,6 +202,14 @@ jobs:
             exit 1
           fi
           echo "✓ пароль хранилища подходит"
+          # Хранилище PKCS12: пароль ключа в нём совпадает с паролем хранилища.
+          # keytool проверяет только STORE_PASSWORD, а неверный KEY_PASSWORD
+          # вскрывался бы лишь на десятой минуте сборки, на подписи AAB.
+          if [ "$CLEAN_KEYPW" != "$CLEAN_STOREPW" ]; then
+            echo "::error::KEY_PASSWORD не совпадает с STORE_PASSWORD (длины: ${#CLEAN_KEYPW} и ${#CLEAN_STOREPW}). Для нашего ключа это один и тот же пароль: обновите оба секрета одним и тем же значением из password.txt."
+            exit 1
+          fi
+          echo "✓ пароль ключа совпадает с паролем хранилища"
           echo "алиасы в хранилище:"; grep -E 'PrivateKeyEntry|trustedCertEntry' /tmp/kl.txt | cut -d, -f1 | sed 's/^/  /'
           if ! keytool -list -keystore "$ks" -storepass "$CLEAN_STOREPW" -alias "$CLEAN_ALIAS" > /dev/null 2>&1; then
             echo "::error::Пароль подходит, но алиаса «$CLEAN_ALIAS» в хранилище нет. KEY_ALIAS должен совпадать с одним из алиасов выше."
