@@ -314,6 +314,21 @@ jobs:
           fi
           echo "✓ имя пакета $pkg"
 
+          # Разрешения смотрим в итоговом APK, после слияния манифестов: их
+          # могут принести и библиотеки, не только наш манифест.
+          perms=$("$aapt2" dump permissions "$apk")
+          if printf '%s\n' "$perms" | grep -q "android.permission.REQUEST_INSTALL_PACKAGES"; then
+            echo "::error::В APK есть REQUEST_INSTALL_PACKAGES. Google Play отклонит сборку."
+            exit 1
+          fi
+          echo "✓ REQUEST_INSTALL_PACKAGES нет"
+          {
+            echo "### Разрешения в APK"
+            echo '```'
+            printf '%s\n' "$perms" | sed -nE "s/.*name='([^']+)'.*/\1/p" | sort
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Проверка подписи и отпечаток
         env:
           IS_RELEASE: ${{ steps.signing.outputs.release }}

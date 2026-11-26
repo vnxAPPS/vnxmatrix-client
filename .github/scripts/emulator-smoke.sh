@@ -8,8 +8,9 @@
 # артефактах запуска.
 #
 # Падает на явных отказах: APK не ставится, процесс приложения умер, в logcat
-# есть FATAL EXCEPTION / UnsatisfiedLinkError / ANR. Остальное собирает как
-# доказательства для разбора.
+# есть FATAL EXCEPTION / UnsatisfiedLinkError / ANR, профиль по ссылке не
+# скачан, User-Agent не FlClash…, после команды START не поднялся туннель.
+# Остальное собирает как доказательства для разбора.
 #
 # Запуск: bash .github/scripts/emulator-smoke.sh <каталог с APK>
 set -u
@@ -65,8 +66,65 @@ for attempt in 1 2 3; do
   fi
 done
 
-sleep 30
+sleep 20
 adb exec-out screencap -p > "$OUT/02-after.png" 2>/dev/null
+
+# --- Ядро: профиль по ссылке, VPN, туннель ---------------------------------
+# На телефоне ломалось именно это: профиль скачан, а ядро не стартует
+# («Перезапустить ядро — Остановлено»). Профиль синтетический, с локального
+# сервера, без наших узлов: стенд проверяет приложение, а не панель.
+PORT=8765
+: > "$OUT/http.log"
+python3 "$(dirname "$0")/smoke-profile-server.py" "$PORT" "$OUT/http.log" &
+SRV=$!
+trap 'kill $SRV 2>/dev/null' EXIT
+adb reverse tcp:$PORT tcp:$PORT > /dev/null
+adb shell "am start -a android.intent.action.VIEW -d 'vnxmatrix://install-config?url=http%3A%2F%2F127.0.0.1%3A$PORT%2Fsub' $PKG" \
+  > "$OUT/link.txt" 2>&1
+
+for _ in $(seq 1 30); do [ -s "$OUT/http.log" ] && break; sleep 2; done
+summary ""
+summary "### Ядро"
+if [ -s "$OUT/http.log" ]; then
+  ua=$(python3 -c 'import json,sys; print(json.loads(open(sys.argv[1]).readline())["headers"].get("User-Agent",""))' "$OUT/http.log")
+  hdrs=$(python3 -c 'import json,sys; h=json.loads(open(sys.argv[1]).readline())["headers"]; print(", ".join(sorted(k for k in h if k.lower().startswith("x-"))))' "$OUT/http.log")
+  summary "- профиль скачан, User-Agent: \`$ua\`"
+  summary "- заголовки устройства: ${hdrs:-нет}"
+  # Панель выбирает формат по началу User-Agent (правило ^flclash → MIHOMO).
+  if ! printf '%s' "$ua" | grep -qi '^flclash'; then
+    echo "::error::User-Agent не начинается с FlClash: панель отдаст base64 вместо YAML."
+    fail=1
+  fi
+else
+  echo "::error::Приложение не скачало профиль по ссылке install-config."
+  summary "- профиль по ссылке не скачан"
+  fail=1
+fi
+sleep 5
+adb exec-out screencap -p > "$OUT/03-profile.png" 2>/dev/null
+
+# Разрешение на VPN выдаём сами: системный диалог на эмуляторе нажать некому.
+adb shell appops set "$PKG" ACTIVATE_VPN allow
+adb shell am start -n "$PKG/com.follow.clashx.QuickActionActivity" -a "$PKG.action.START" \
+  > "$OUT/vpn-start.txt" 2>&1
+tun=""
+for _ in $(seq 1 30); do
+  tun=$(adb shell ip -o link 2>/dev/null | grep -oE 'tun[0-9]+' | head -1)
+  [ -n "$tun" ] && break
+  sleep 2
+done
+adb shell ip addr > "$OUT/ip-addr.txt" 2>&1
+adb shell dumpsys connectivity > "$OUT/connectivity.txt" 2>&1
+sleep 3
+adb exec-out screencap -p > "$OUT/04-vpn.png" 2>/dev/null
+if [ -n "$tun" ]; then
+  summary "- VPN включён, туннель \`$tun\` поднят: ядро стартовало"
+else
+  echo "::error::После команды START туннель не появился: ядро или VpnService не стартовали."
+  summary "- туннель не поднялся за минуту"
+  fail=1
+fi
+sleep 10
 adb shell ps -A -o PID,NAME > "$OUT/ps.txt" 2>&1
 adb shell dumpsys activity services "$PKG" > "$OUT/services.txt" 2>&1
 adb logcat -d -v time > "$OUT/logcat.txt" 2>&1
