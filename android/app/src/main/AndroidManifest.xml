@@ -72,6 +72,7 @@
                 <data android:scheme="clashmeta" />
                 <data android:scheme="flclash" />
                 <data android:scheme="flclashx" />
+                <data android:scheme="vnxmatrix" />
                 <data android:scheme="clashx" />
 
                 <data android:host="install-config" />

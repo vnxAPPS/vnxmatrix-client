@@ -1,0 +1,443 @@
+name: android-release
+
+# Сборка vnxMATRIX для Android на базе FlClashX 0.5.8: AAB для Google Play,
+# APK для ручной раздачи и проверка на эмуляторе.
+#
+# Почему отдельный workflow: build.yaml апстрима собирает все платформы и
+# публикует только из pluralplay/FlClashX по тегу. Здесь Android изолирован,
+# и ничего, кроме него, выпуск не держит.
+#
+# Запуск:
+#   • вручную: Actions → android-release → Run workflow;
+#   • автоматически: пуш в release/** или в рабочие ветки claude/vnxmatrix-rebrand-v2-*.
+#
+# Результат (вкладка запуска → Artifacts):
+#   • android-release-<код>: vnxMATRIX-play.aab для Play и vnxMATRIX-android-*.apk;
+#   • smoke-<код>: logcat, скриншоты и дамп экрана со стенда.
+
+on:
+  workflow_dispatch:
+    inputs:
+      allow_debug_signing:
+        description: "Разрешить сборку без релизного ключа (debug-подпись). Play такой AAB отклонит"
+        type: boolean
+        default: false
+      upload_to_play:
+        description: "Отправить AAB в Google Play (трек internal). Нужен секрет PLAY_SERVICE_ACCOUNT_JSON"
+        type: boolean
+        default: false
+  push:
+    # release/** — боевые сборки, ключ подписи обязателен.
+    # claude/vnxmatrix-rebrand-v2-* — рабочие ветки: проверка, что конвейер
+    # жив; без секретов допускается debug-ключ (артефакт помечается DEBUGKEY).
+    branches: ["release/**", "claude/vnxmatrix-rebrand-v2-*"]
+    paths-ignore: ["docs/**", "**/*.md"]
+
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Менять нельзя: после публикации в Play applicationId не меняется никогда.
+  EXPECTED_APPLICATION_ID: com.vnxmatrix.client
+  # Версии инструментов — как в build.yaml апстрима 0.5.8.
+  FLUTTER_VERSION: "3.47.6"
+  GO_VERSION: "1.27.1"
+  NDK_VERSION: r28c
+  # Корневые сертификаты, которым доверяет приложение (assets/ca). Апстрим
+  # закрепляет файл по хэшу; новая версия — осознанное обновление.
+  CA_BUNDLE: cacert-2026-10-20.pem
+  CA_BUNDLE_SHA256: 796f1389bfea13c0ed78f663b765baaff54a508e5483786bd6ece73c5e3e3cbe
+
+jobs:
+  # ── Инварианты проекта: дешёвые проверки того, что ломать нельзя ───────────
+  guard:
+    name: Project invariants
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: applicationId не изменился
+        run: |
+          grep -q "applicationId = \"${EXPECTED_APPLICATION_ID}\"" android/app/build.gradle.kts || {
+            echo "::error::applicationId в android/app/build.gradle.kts не равен ${EXPECTED_APPLICATION_ID}."
+            exit 1
+          }
+          echo "✓ applicationId = ${EXPECTED_APPLICATION_ID}"
+
+      - name: User-Agent начинается с FlClashX
+        run: |
+          # Панель подписки выбирает формат по началу User-Agent (^flclash →
+          # MIHOMO). В 0.5.8 он собирается из константы, и если подставить туда
+          # appName, клиенты получат base64 вместо YAML.
+          grep -q "^const uaAppName = 'FlClashX';" lib/common/constant.dart || {
+            echo "::error::lib/common/constant.dart: uaAppName должен быть 'FlClashX'."; exit 1; }
+          grep -q "'\$uaAppName/v\$displayVersion'" lib/common/package.dart || {
+            echo "::error::lib/common/package.dart: User-Agent должен собираться из uaAppName, не из appName."; exit 1; }
+          echo "✓ User-Agent совместим с правилами панели"
+
+      - name: Нет секретов в коде
+        run: |
+          patterns='[0-9]{8,10}:AA[A-Za-z0-9_-]{33}|gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,}|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+          if git grep -nIE "$patterns" > /tmp/hits.txt; then
+            echo "::error::Похоже на секрет в коде. Значения не печатаем — только места:"
+            cut -d: -f1,2 /tmp/hits.txt
+            exit 1
+          fi
+          echo "✓ секретов не найдено"
+
+      - name: keystore не закоммичен
+        run: |
+          if git ls-files | grep -E '\.(jks|keystore|p12)$'; then
+            echo "::error::В репозитории лежит файл ключа подписи."
+            exit 1
+          fi
+          echo "✓ файлов ключей в репозитории нет"
+
+  # ── Сборка ─────────────────────────────────────────────────────────────────
+  build:
+    name: Build AAB + APK
+    needs: [guard]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    outputs:
+      artifact: ${{ steps.meta.outputs.artifact }}
+      release: ${{ steps.signing.outputs.release }}
+    env:
+      KEYSTORE_B64: ${{ secrets.KEYSTORE }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+      STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Проверить наличие ключа подписи
+        id: signing
+        env:
+          # На рабочей ветке пуш допускает debug-ключ без вопросов. На release/**
+          # и при ручном запуске — только если явно включён allow_debug_signing.
+          ALLOW_DEBUG: ${{ (github.event_name == 'push' && !startsWith(github.ref, 'refs/heads/release/')) || inputs.allow_debug_signing }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ] && [ -n "$KEY_ALIAS" ] && [ -n "$STORE_PASSWORD" ] && [ -n "$KEY_PASSWORD" ]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "✓ найдены все четыре секрета подписи"
+          elif [ "$ALLOW_DEBUG" = "true" ]; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Секретов подписи нет, сборка пойдёт с DEBUG-ключом. Google Play такой AAB не примет."
+          else
+            echo "::error::Нет секретов подписи. Нужны KEYSTORE (base64), KEY_ALIAS, STORE_PASSWORD, KEY_PASSWORD — Settings → Secrets and variables → Actions. Для пробной сборки без ключа запустите вручную с allow_debug_signing=true."
+            exit 1
+          fi
+
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: core/go.sum
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: NDK
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+          link-to-sdk: true
+
+      - name: Зависимости Flutter
+        run: |
+          flutter --version
+          flutter pub get
+
+      - name: Очистить значения секретов
+        if: steps.signing.outputs.release == 'true'
+        run: |
+          # Секреты, вставленные через буфер обмена, часто несут лишний перевод
+          # строки, возврат каретки или пробел. Для пароля это значит «неверный
+          # пароль», хотя на глаз он правильный. Лишнее убираем и говорим об этом.
+          clean() { printf '%s' "$1" | tr -d '\r\n' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'; }
+          a=$(clean "$KEY_ALIAS"); s=$(clean "$STORE_PASSWORD"); k=$(clean "$KEY_PASSWORD")
+          for pair in "KEY_ALIAS:$KEY_ALIAS:$a" "STORE_PASSWORD:$STORE_PASSWORD:$s" "KEY_PASSWORD:$KEY_PASSWORD:$k"; do
+            name=${pair%%:*}; rest=${pair#*:}; raw=${rest%:*}; cleaned=${rest##*:}
+            if [ "${#raw}" != "${#cleaned}" ]; then
+              echo "::warning::В секрете $name были лишние пробелы или переводы строки (${#raw} → ${#cleaned} символов). Они убраны автоматически; секрет лучше пересоздать без них."
+            fi
+          done
+          echo "длины: алиас=${#a}, пароль хранилища=${#s}, пароль ключа=${#k}"
+          # Пароль — 32 символа. Значение в сотни символов — это текст ключа
+          # (KEYSTORE), вставленный не в тот секрет: так уже случилось с
+          # KEY_PASSWORD (5780 символов).
+          for pair in "STORE_PASSWORD:${#s}" "KEY_PASSWORD:${#k}"; do
+            if [ "${pair##*:}" -gt 128 ]; then
+              echo "::error::В ${pair%%:*} ${pair##*:} символов: это не пароль, а, похоже, текст ключа (KEYSTORE). Пароль — 32 символа из файла password.txt."
+              exit 1
+            fi
+          done
+          echo "::add-mask::$s"
+          echo "::add-mask::$k"
+          {
+            echo "CLEAN_ALIAS=$a"
+            echo "CLEAN_STOREPW=$s"
+            echo "CLEAN_KEYPW=$k"
+          } >> "$GITHUB_ENV"
+
+      - name: Подпись релизным ключом
+        if: steps.signing.outputs.release == 'true'
+        run: |
+          # Gradle берёт ключ из android/app/keystore.jks и параметры из
+          # android/local.properties (см. android/app/build.gradle.kts).
+          printf '%s' "$KEYSTORE_B64" | tr -d '\r\n ' | base64 --decode > android/app/keystore.jks
+
+          # Файл, который создаёт Flutter, заканчивается БЕЗ перевода строки.
+          # Без этого первая дописанная строка приклеивалась к flutter.sdk=…, и
+          # Gradle не видел keyAlias: он молча подписывал debug-ключом.
+          printf '\n' >> android/local.properties
+          {
+            printf 'keyAlias=%s\n' "$CLEAN_ALIAS"
+            printf 'storePassword=%s\n' "$CLEAN_STOREPW"
+            printf 'keyPassword=%s\n' "$CLEAN_KEYPW"
+          } >> android/local.properties
+
+          for key in keyAlias storePassword keyPassword; do
+            grep -q "^${key}=" android/local.properties || { echo "::error::В android/local.properties нет свойства ${key}."; exit 1; }
+          done
+          echo "✓ релизный ключ подключён, свойства на месте"
+
+      - name: Быстрая проверка ключа (до долгой сборки)
+        if: steps.signing.outputs.release == 'true'
+        run: |
+          # Падаем за минуту, а не после двенадцати минут сборки, и говорим, ЧТО
+          # именно не подошло: пароль или алиас.
+          ks=android/app/keystore.jks
+          if ! keytool -list -keystore "$ks" -storepass "$CLEAN_STOREPW" > /tmp/kl.txt 2>&1; then
+            echo "::error::STORE_PASSWORD не подходит к хранилищу. Файл KEYSTORE в порядке ($(wc -c < $ks) байт), значит пароль введён не тот. Проверьте, что вставлен именно пароль из Cloud Shell (32 символа, цифры и буквы a-f), без подписи «ПАРОЛЬ:»."
+            exit 1
+          fi
+          echo "✓ пароль хранилища подходит"
+          # Хранилище PKCS12: пароль ключа в нём совпадает с паролем хранилища.
+          # keytool проверяет только STORE_PASSWORD, а неверный KEY_PASSWORD
+          # вскрывался бы лишь на десятой минуте сборки, на подписи AAB.
+          if [ "$CLEAN_KEYPW" != "$CLEAN_STOREPW" ]; then
+            echo "::error::KEY_PASSWORD не совпадает с STORE_PASSWORD (длины: ${#CLEAN_KEYPW} и ${#CLEAN_STOREPW}). Для нашего ключа это один и тот же пароль: обновите оба секрета одним и тем же значением из password.txt."
+            exit 1
+          fi
+          echo "✓ пароль ключа совпадает с паролем хранилища"
+          echo "алиасы в хранилище:"; grep -E 'PrivateKeyEntry|trustedCertEntry' /tmp/kl.txt | cut -d, -f1 | sed 's/^/  /'
+          if ! keytool -list -keystore "$ks" -storepass "$CLEAN_STOREPW" -alias "$CLEAN_ALIAS" > /dev/null 2>&1; then
+            echo "::error::Пароль подходит, но алиаса «$CLEAN_ALIAS» в хранилище нет. KEY_ALIAS должен совпадать с одним из алиасов выше."
+            exit 1
+          fi
+          echo "✓ алиас найден"
+          keytool -list -v -keystore "$ks" -storepass "$CLEAN_STOREPW" -alias "$CLEAN_ALIAS" 2>&1 \
+            | grep -E 'Owner|Valid from|SHA256' || true
+          echo "--- свойства, которые увидит Gradle (только имена):"
+          cut -d= -f1 android/local.properties | sort | tr '\n' ' '; echo
+
+
+      - name: Корневые сертификаты
+        run: |
+          mkdir -p assets/ca
+          bundle=assets/ca/ca-certificates.crt
+          curl -fsSL --retry 3 -o "$bundle" "https://curl.se/ca/$CA_BUNDLE"
+          echo "$CA_BUNDLE_SHA256  $bundle" | sha256sum -c -
+
+      - name: Версия сборки
+        id: version
+        run: |
+          # versionCode в Play обязан расти с каждой загрузкой (лимит
+          # 2 100 000 000). Номер сборки — минуты с 2026-01-01 UTC; Gradle
+          # апстрима прибавляет к нему 5000. Номер подставляется в pubspec, чтобы
+          # и setup.dart, и сборка AAB получили одно и то же значение.
+          now=$(date -u +%s); epoch=$(date -u -d '2026-01-01T00:00:00Z' +%s)
+          code=$(( (now - epoch) / 60 ))
+          name=$(grep -E '^version:' pubspec.yaml | sed -E 's/version:\s*([0-9.]+).*/\1/')
+          sed -i -E "s/^version: ([0-9.]+)\+[0-9]+/version: \1+${code}/" pubspec.yaml
+          grep -E '^version:' pubspec.yaml
+          core=$(sed -n 's/^core_version: *//p' build_config.yaml)
+          [ -n "$core" ] || { echo "::error::Не удалось прочитать core_version из build_config.yaml"; exit 1; }
+          {
+            echo "code=$code"
+            echo "version_code=$(( code + 5000 ))"
+            echo "name=$name"
+            echo "core=$core"
+          } >> "$GITHUB_OUTPUT"
+          echo "versionName=$name versionCode=$(( code + 5000 )) mihomo=$core"
+
+      - name: Ядро и APK (setup.dart апстрима)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: dart setup.dart android --env stable -v
+
+      - name: Сборка AAB для Google Play
+        run: |
+          # Те же определения, что передаёт setup.dart. APP_ENV=stable обязателен:
+          # без него Gradle апстрима считает сборку каналом pre и добавляет к
+          # имени пакета суффикс .pre.
+          flutter build appbundle --release \
+            --dart-define=APP_ENV=stable \
+            --dart-define=APP_VERSION=${{ steps.version.outputs.name }} \
+            --dart-define=CORE_VERSION=${{ steps.version.outputs.core }}
+
+      - name: Имя пакета в собранном APK
+        env:
+          IS_RELEASE: ${{ steps.signing.outputs.release }}
+        run: |
+          # Суффиксы .pre и .dev Gradle добавляет молча. Для Play имя пакета
+          # обязано быть ровно com.vnxmatrix.client.
+          aapt2=$(ls -d "$ANDROID_HOME"/build-tools/*/aapt2 | sort -V | tail -1)
+          apk=build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+          badging=$("$aapt2" dump badging "$apk" | head -1)
+          echo "$badging"
+          pkg=$(printf '%s' "$badging" | sed -nE "s/.*name='([^']+)'.*/\1/p")
+          expected="$EXPECTED_APPLICATION_ID"
+          [ "$IS_RELEASE" = "true" ] || expected="$EXPECTED_APPLICATION_ID.dev"
+          if [ "$pkg" != "$expected" ]; then
+            echo "::error::Имя пакета в APK: $pkg, ожидалось $expected."
+            exit 1
+          fi
+          echo "✓ имя пакета $pkg"
+
+      - name: Проверка подписи и отпечаток
+        env:
+          IS_RELEASE: ${{ steps.signing.outputs.release }}
+        run: |
+          aab=build/app/outputs/bundle/release/app-release.aab
+          [ -f "$aab" ] || { echo "::error::AAB не собран: $aab"; exit 1; }
+
+          cert=$(keytool -printcert -jarfile "$aab" 2>&1 || true)
+          sha256=$(printf '%s\n' "$cert" | grep -m1 'SHA256:' | sed 's/^\s*//')
+          owner=$(printf '%s\n' "$cert" | grep -m1 -E '^(Owner|Владелец):' | sed 's/^\s*//')
+
+          echo "--- сертификат AAB:"; printf '%s\n' "$cert" | grep -E 'Owner|Владелец|SHA256|Valid|Signer|Exception|error' | head -6 || true
+
+          if printf '%s' "$cert" | grep -qi 'CN=Android Debug'; then
+            if [ "$IS_RELEASE" = "true" ]; then
+              echo "::error::Секреты подписи были, но AAB подписан debug-ключом. Проверьте android/local.properties и путь к keystore.jks."
+              exit 1
+            fi
+            echo "::warning::AAB подписан DEBUG-ключом — для Google Play непригоден."
+          fi
+
+          {
+            echo "## Подпись AAB"
+            echo
+            echo "- Тип: $([ "$IS_RELEASE" = "true" ] && echo 'релизный ключ' || echo '⚠️ DEBUG, в Play не пойдёт')"
+            echo "- ${owner:-Owner: не определён}"
+            echo "- ${sha256:-SHA256: не определён}"
+            echo "- versionName: ${{ steps.version.outputs.name }}"
+            echo "- versionCode: ${{ steps.version.outputs.version_code }} (номер сборки ${{ steps.version.outputs.code }} + 5000 от апстрима)"
+            echo "- mihomo: ${{ steps.core.outputs.version }}"
+            echo
+            echo "Отпечаток SHA256 можно сверять с Play Console → Настройка → Целостность приложения."
+            echo "Это публичный идентификатор ключа, не секрет."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Диагностика подписи (только при падении)
+        if: failure() && steps.signing.outputs.release == 'true'
+        run: |
+          # gradlew создаётся Flutter при первой сборке, поэтому отчёт доступен
+          # только здесь. Показывает, какую подпись Gradle реально выбрал.
+          echo "keystore.jks: $(ls -la android/app/keystore.jks 2>&1 | awk '{print $5" байт"}')"
+          echo "свойства: $(cut -d= -f1 android/local.properties 2>&1 | sort | tr '\n' ' ')"
+          if [ -x android/gradlew ]; then
+            (cd android && ./gradlew :app:signingReport --no-daemon -q 2>&1) \
+              | grep -A4 -E '^Variant: release$' | grep -E 'Variant|Config|Store|Alias' || echo "(блок release не найден)"
+          else
+            echo "gradlew не найден"
+          fi
+
+      - name: Собрать артефакты
+        id: meta
+        env:
+          IS_RELEASE: ${{ steps.signing.outputs.release }}
+        run: |
+          # Сборка с debug-ключом получает в имени метку DEBUGKEY: иначе её
+          # легко перепутать с релизной и попытаться загрузить в Play.
+          tag=$([ "$IS_RELEASE" = "true" ] && echo "" || echo "-DEBUGKEY")
+          mkdir -p dist-vnx
+          cp build/app/outputs/bundle/release/app-release.aab "dist-vnx/vnxMATRIX-play${tag}.aab"
+          for apk in build/app/outputs/flutter-apk/app-*-release.apk; do
+            abi=$(basename "$apk" | sed -E 's/app-(.*)-release\.apk/\1/')
+            cp "$apk" "dist-vnx/vnxMATRIX-android-${abi}${tag}.apk"
+          done
+          ls -la dist-vnx
+          rm -f android/app/keystore.jks
+          echo "artifact=android-release-${{ steps.version.outputs.version_code }}${tag}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.meta.outputs.artifact }}
+          path: dist-vnx/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Отправить в Google Play (internal)
+        if: inputs.upload_to_play == true && steps.signing.outputs.release == 'true'
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: com.vnxmatrix.client
+          releaseFiles: dist-vnx/vnxMATRIX-play.aab  # только релизная подпись: шаг ниже требует release=true
+          # Тексты «Что нового» (до 500 символов на язык) — файлы вида whatsnew-<локаль>.
+          whatsNewDirectory: distribution/whatsnew
+          track: internal
+          # draft — безопасно для первого релиза: Play принимает файл, но не
+          # раздаёт его, пока вы не нажмёте «Начать развёртывание» в консоли.
+          status: draft
+
+  # ── Стенд: эмулятор Android ────────────────────────────────────────────────
+  # Ставит x86_64 APK, запускает приложение, проходит экран согласия и
+  # проверяет, что оно живо. logcat и скриншоты — в артефакте smoke-…
+  smoke:
+    name: Emulator smoke test
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v6
+        with:
+          name: ${{ needs.build.outputs.artifact }}
+          path: dist-vnx
+
+      - name: Включить KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Эмулятор и тест
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          script: bash .github/scripts/emulator-smoke.sh dist-vnx
+
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: smoke-${{ needs.build.outputs.artifact }}
+          path: smoke/
+          retention-days: 14
