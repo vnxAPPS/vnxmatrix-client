@@ -305,7 +305,9 @@ jobs:
           apk=build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
           badging=$("$aapt2" dump badging "$apk" | head -1)
           echo "$badging"
-          pkg=$(printf '%s' "$badging" | sed -nE "s/.*name='([^']+)'.*/\1/p")
+          # Только первое поле name= строки package: дальше идёт
+          # platformBuildVersionName='…', и жадное .*name= взяло бы его.
+          pkg=$(printf '%s' "$badging" | sed -nE "s/^package: name='([^']+)'.*/\1/p")
           expected="$EXPECTED_APPLICATION_ID"
           [ "$IS_RELEASE" = "true" ] || expected="$EXPECTED_APPLICATION_ID.dev"
           if [ "$pkg" != "$expected" ]; then
