@@ -161,6 +161,15 @@ jobs:
             fi
           done
           echo "длины: алиас=${#a}, пароль хранилища=${#s}, пароль ключа=${#k}"
+          # Пароль — 32 символа. Значение в сотни символов — это текст ключа
+          # (KEYSTORE), вставленный не в тот секрет: так уже случилось с
+          # KEY_PASSWORD (5780 символов).
+          for pair in "STORE_PASSWORD:${#s}" "KEY_PASSWORD:${#k}"; do
+            if [ "${pair##*:}" -gt 128 ]; then
+              echo "::error::В ${pair%%:*} ${pair##*:} символов: это не пароль, а, похоже, текст ключа (KEYSTORE). Пароль — 32 символа из файла password.txt."
+              exit 1
+            fi
+          done
           echo "::add-mask::$s"
           echo "::add-mask::$k"
           {
