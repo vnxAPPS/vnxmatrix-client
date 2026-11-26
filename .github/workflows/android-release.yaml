@@ -444,6 +444,10 @@ jobs:
 
       - name: Эмулятор и тест
         uses: reactivecircus/android-emulator-runner@v2
+        env:
+          # Тестовая подписка для проверки трафика через наши серверы.
+          # Только секретом: репозиторий публичный.
+          SMOKE_SUB_URL: ${{ secrets.SMOKE_SUB_URL }}
         with:
           api-level: 34
           arch: x86_64

@@ -45,17 +45,31 @@ sleep 15
 adb exec-out screencap -p > "$OUT/01-start.png" 2>/dev/null
 
 # Flutter отдаёт подписи кнопок в content-desc, обычные виджеты — в text,
-# поэтому ищем по обоим. Первым экраном идёт согласие с условиями.
+# поэтому ищем по обоим. Только кликабельные элементы и только полное
+# совпадение подписи: иначе стенд жмёт в абзац «By tapping “I agree”…»
+# вместо самой кнопки (так и было в первом прогоне).
 tap_label() {
   adb shell uiautomator dump /sdcard/ui.xml > /dev/null 2>&1 || return 1
   adb shell cat /sdcard/ui.xml > "$OUT/ui.xml" 2>/dev/null || return 1
-  local bounds
-  bounds=$(grep -oE "<node[^>]*(text|content-desc)=\"[^\"]*($1)[^\"]*\"[^>]*bounds=\"\[[0-9]+,[0-9]+\]\[[0-9]+,[0-9]+\]\"" "$OUT/ui.xml" \
-    | head -1 | grep -oE 'bounds="[^"]+"' | grep -oE '[0-9]+' | tr '\n' ' ')
-  [ -n "$bounds" ] || return 1
+  local xy
+  xy=$(python3 - "$OUT/ui.xml" "$1" <<'PY'
+import re, sys
+xml, pattern = open(sys.argv[1], encoding="utf-8", errors="replace").read(), sys.argv[2]
+label = re.compile(rf"(?:{pattern})")
+for node in re.findall(r"<node [^>]*>", xml):
+    attrs = dict(re.findall(r'([\w-]+)="([^"]*)"', node))
+    if attrs.get("clickable") != "true" or attrs.get("enabled") == "false":
+        continue
+    names = [attrs.get("text", ""), attrs.get("content-desc", "")]
+    if any(label.fullmatch(n.strip()) for n in names if n):
+        x1, y1, x2, y2 = map(int, re.findall(r"\d+", attrs["bounds"]))
+        print((x1 + x2) // 2, (y1 + y2) // 2)
+        break
+PY
+)
+  [ -n "$xy" ] || return 1
   # shellcheck disable=SC2086
-  set -- $bounds
-  adb shell input tap $(( ($1 + $3) / 2 )) $(( ($2 + $4) / 2 ))
+  adb shell input tap $xy
   return 0
 }
 
@@ -73,6 +87,47 @@ adb exec-out screencap -p > "$OUT/02-after.png" 2>/dev/null
 # На телефоне ломалось именно это: профиль скачан, а ядро не стартует
 # («Перезапустить ядро — Остановлено»). Профиль синтетический, с локального
 # сервера, без наших узлов: стенд проверяет приложение, а не панель.
+# Настоящая подписка (секрет SMOKE_SUB_URL) — если задана, стенд проверяет
+# ещё и главное: трафик идёт через наш сервер. Она импортируется первой, чтобы
+# стать текущим профилем; синтетический профиль после неё нужен только для
+# проверки User-Agent. Каждый прогон занимает в подписке одно устройство (HWID).
+# Адрес подписки нигде не печатается, а файлы стенда перед выгрузкой
+# вычищаются от него (scrub ниже): репозиторий публичный.
+REAL=${SMOKE_SUB_URL:-}
+REAL_ENC=""
+[ -n "$REAL" ] && REAL_ENC=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$REAL")
+
+scrub() {
+  [ -n "$REAL" ] || return 0
+  python3 - "$OUT" "$REAL" "$REAL_ENC" <<'PY'
+import pathlib, sys
+out, *secrets = sys.argv[1:]
+token = secrets[0].rstrip("/").rsplit("/", 1)[-1]
+needles = [s for s in secrets + [token] if len(s) >= 8]
+for f in pathlib.Path(out).rglob("*"):
+    if f.is_file() and f.suffix in {".txt", ".xml", ".log", ".json"}:
+        text = f.read_text(errors="replace")
+        for n in needles:
+            text = text.replace(n, "***")
+        f.write_text(text)
+PY
+}
+
+# Внешний IP, как его видит интернет. toybox nc есть в образах Android 10+.
+public_ip() {
+  adb shell "printf 'GET / HTTP/1.0\r\nHost: api.ipify.org\r\n\r\n' | nc -w 10 api.ipify.org 80" 2>/dev/null \
+    | tr -d '\r' | tail -1 | grep -oE '^[0-9]+(\.[0-9]+){3}$'
+}
+mask_ip() { printf '%s' "$1" | sed -E 's/^([0-9]+)\..*/\1.x.x.x/'; }
+
+ip_before=""
+if [ -n "$REAL" ]; then
+  ip_before=$(public_ip)
+  adb shell "am start -a android.intent.action.VIEW -d 'vnxmatrix://install-config?url=$REAL_ENC' $PKG" > /dev/null 2>&1
+  # Скачивание идёт через панель; дать ему время.
+  sleep 30
+fi
+
 PORT=8765
 : > "$OUT/http.log"
 python3 "$(dirname "$0")/smoke-profile-server.py" "$PORT" "$OUT/http.log" &
@@ -125,9 +180,27 @@ else
   fail=1
 fi
 sleep 10
+
+if [ -n "$REAL" ]; then
+  ip_after=$(public_ip)
+  adb exec-out screencap -p > "$OUT/05-real-vpn.png" 2>/dev/null
+  if [ -z "$ip_before" ] && [ -z "$ip_after" ]; then
+    echo "::warning::Не удалось узнать внешний IP (нет nc или нет сети): проверка трафика пропущена."
+    summary "- проверка трафика через наш сервер пропущена: внешний IP недоступен"
+  elif [ -n "$ip_after" ] && [ "$ip_after" != "$ip_before" ]; then
+    summary "- **трафик идёт через наш сервер**: внешний IP сменился ($(mask_ip "$ip_before") → $(mask_ip "$ip_after"))"
+  else
+    echo "::error::С настоящей подпиской внешний IP не сменился: трафик не идёт через наш сервер (или подписка не загрузилась)."
+    summary "- внешний IP не сменился после включения VPN ($(mask_ip "$ip_before") → $(mask_ip "${ip_after:-нет ответа}"))"
+    fail=1
+  fi
+else
+  summary "- настоящая подписка не задана (секрет SMOKE_SUB_URL): проверен только запуск ядра"
+fi
 adb shell ps -A -o PID,NAME > "$OUT/ps.txt" 2>&1
 adb shell dumpsys activity services "$PKG" > "$OUT/services.txt" 2>&1
 adb logcat -d -v time > "$OUT/logcat.txt" 2>&1
+scrub
 
 summary ""
 summary "### Процессы приложения"
@@ -161,4 +234,5 @@ summary '```'
 summary ""
 summary "Полный logcat, скриншоты и дамп экрана — в артефакте smoke-…"
 
+scrub
 exit $fail
