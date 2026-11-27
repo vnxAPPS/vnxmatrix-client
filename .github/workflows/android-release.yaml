@@ -79,6 +79,17 @@ jobs:
             echo "::error::lib/common/constant.dart: uaAppName должен быть 'FlClashX'."; exit 1; }
           grep -q "'\$uaAppName/v\$displayVersion'" lib/common/package.dart || {
             echo "::error::lib/common/package.dart: User-Agent должен собираться из uaAppName, не из appName."; exit 1; }
+
+          # Каналы связи Dart ↔ Kotlin называются по этим двум константам.
+          # Разойдутся — каждый вызов службы падает с MissingPluginException,
+          # и ядро молча не стартует (так и было в первом переносе на 0.5.8).
+          dart_ns=$(sed -nE "s/^const packageName = '([^']+)';/\1/p" lib/common/constant.dart)
+          kt_ns=$(sed -nE 's/.*const val PACKAGE_NAME = "([^"]+)".*/\1/p' android/common/src/main/java/com/follow/clashx/common/Components.kt)
+          if [ -z "$dart_ns" ] || [ "$dart_ns" != "$kt_ns" ]; then
+            echo "::error::Пространство имён каналов разошлось: Dart packageName='$dart_ns', Kotlin PACKAGE_NAME='$kt_ns'."
+            exit 1
+          fi
+          echo "✓ каналы Dart и Kotlin в одном пространстве имён: $dart_ns"
           echo "✓ User-Agent совместим с правилами панели"
 
       - name: Нет секретов в коде

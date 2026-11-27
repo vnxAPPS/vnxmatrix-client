@@ -4,7 +4,15 @@ import 'package:win32_registry/win32_registry.dart';
 
 import 'print.dart';
 
-const protocolSchemes = ['clash', 'clashmeta', 'flclash', 'flclashx', 'clashx'];
+const protocolSchemes = [
+  'clash',
+  'clashmeta',
+  'flclash',
+  'flclashx',
+  'clashx',
+  // vnxMATRIX: своя схема для ссылок из бота (vnxmatrix://install-config?url=…).
+  'vnxmatrix',
+];
 
 class ProtocolRegistrationPlan {
   final String scheme;

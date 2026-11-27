@@ -8,7 +8,8 @@
 # артефактах запуска.
 #
 # Падает на явных отказах: APK не ставится, процесс приложения умер, в logcat
-# есть FATAL EXCEPTION / UnsatisfiedLinkError / ANR, профиль по ссылке не
+# есть FATAL EXCEPTION / UnsatisfiedLinkError / MissingPluginException / ANR,
+# профиль по ссылке не
 # скачан, User-Agent не FlClash…, после команды START не поднялся туннель.
 # Остальное собирает как доказательства для разбора.
 #
@@ -214,7 +215,7 @@ if ! grep -qi "$PKG" "$OUT/ps.txt"; then
   fail=1
 fi
 
-crashes=$(grep -nE "FATAL EXCEPTION|UnsatisfiedLinkError|ANR in $PKG|Fatal signal" "$OUT/logcat.txt" | head -20)
+crashes=$(grep -nE "FATAL EXCEPTION|UnsatisfiedLinkError|MissingPluginException|ANR in $PKG|Fatal signal" "$OUT/logcat.txt" | head -20)
 if [ -n "$crashes" ]; then
   echo "::error::В logcat есть падения приложения."
   summary ""

@@ -38,7 +38,7 @@ void main() {
         'Exec="/home/me/Apps/FlClash.AppImage" %u\n'
         'MimeType=x-scheme-handler/clash;x-scheme-handler/clashmeta;'
         'x-scheme-handler/flclash;x-scheme-handler/flclashx;'
-        'x-scheme-handler/clashx;\n',
+        'x-scheme-handler/clashx;x-scheme-handler/vnxmatrix;\n',
       );
     });
 
@@ -51,6 +51,7 @@ void main() {
         'x-scheme-handler/flclash',
         'x-scheme-handler/flclashx',
         'x-scheme-handler/clashx',
+        'x-scheme-handler/vnxmatrix',
       ]);
     });
 

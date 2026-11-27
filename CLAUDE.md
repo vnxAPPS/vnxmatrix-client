@@ -79,6 +79,7 @@ GitHub для форка по умолчанию подставляет базо
 | `applicationId` | `com.vnxmatrix.client` | после публикации в Play не меняется никогда |
 | `uaAppName` в `lib/common/constant.dart` | `FlClashX` | по началу User-Agent панель выбирает формат конфига |
 | `Components.PACKAGE_NAME` в `android/common` | `com.follow.clashx` | это пространство имён классов и имя каналов, не имя пакета приложения |
+| `packageName` в `lib/common/constant.dart` | `com.follow.clashx` | двойник `Components.PACKAGE_NAME` для каналов Dart ↔ Kotlin; разойдутся — ядро не стартует (MissingPluginException). CI сверяет |
 | `namespace` в `android/app/build.gradle.kts` | `com.follow.clashx` | от него зависят имена классов и JNI-функций ядра |
 | Windows `AppId` | `1E89F706-1B37-4D56-A036-6CB998291BC3` | иначе установщик обновит чужое приложение |
 

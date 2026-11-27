@@ -20,7 +20,11 @@ final appSystemName = isPreDesktopApp ? '$appName Pre' : appName;
 const coreManifestName = 'manifest.json';
 const browserUa =
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-const packageName = 'com.vnxmatrix.client';
+/// Пространство имён каналов связи с нативной частью ('$packageName/service',
+/// '/core', '/app'…). Двойник Components.PACKAGE_NAME в android/common и
+/// обязан совпадать с ним, иначе каждый вызов падает с MissingPluginException
+/// и ядро не стартует. Это НЕ имя пакета в Google Play (оно в build.gradle.kts).
+const packageName = 'com.follow.clashx';
 final unixSocketPath = '/tmp/FlClashSocket_${Random().nextInt(10000)}.sock';
 final windowsPipeName = '\\\\.\\pipe\\FlClashCore_${_randomPipeId()}';
 const helperPort = 47890;
