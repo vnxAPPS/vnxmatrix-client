@@ -621,9 +621,10 @@ void main() {
     await select(_profile(2, view: 'proxies.type:tab'));
     expect(container.read(appSettingProvider).floatingNavigationBar, isTrue);
     expect(container.read(appSettingProvider).tabAnimation, TabAnimation.fade);
+    // Без заголовка — обратно к значению по умолчанию (в vnxMATRIX — максимум).
     expect(
       container.read(themeSettingProvider).liquidGlass,
-      LiquidGlassMode.none,
+      LiquidGlassMode.ultra,
     );
   });
 

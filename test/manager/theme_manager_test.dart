@@ -61,7 +61,9 @@ void main() {
       notifier.value = change(notifier.value);
     }
 
-    update((props) => props.copyWith(liquidGlass: LiquidGlassMode.ultra));
+    // Любой уровень, кроме текущего по умолчанию (ultra): иначе состояние
+    // не изменится и тест не проверит то, что должен.
+    update((props) => props.copyWith(liquidGlass: LiquidGlassMode.standard));
     await tester.pump();
     update((props) => props.copyWith(pureBlack: !props.pureBlack));
     await tester.pump();

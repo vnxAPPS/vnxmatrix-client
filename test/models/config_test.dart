@@ -711,7 +711,8 @@ void main() {
       LiquidGlassMode modeOf(Object? value) =>
           ThemeProps.fromJson({'liquidGlass': value}).liquidGlass;
 
-      expect(modeOf(null), LiquidGlassMode.none);
+      // Без сохранённого выбора — значение по умолчанию (максимум).
+      expect(modeOf(null), LiquidGlassMode.ultra);
       expect(modeOf(true), LiquidGlassMode.standard);
       expect(modeOf(false), LiquidGlassMode.none);
       for (final mode in LiquidGlassMode.values) {

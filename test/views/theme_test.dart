@@ -248,7 +248,7 @@ void main() {
   });
 
   group('liquid glass', () {
-    testWidgets('is off until a tier is chosen, and switches back', (
+    testWidgets('starts at the maximum tier and switches between tiers', (
       tester,
     ) async {
       await pumpThemeView(tester);
@@ -259,7 +259,7 @@ void main() {
       Finder choice(String label) =>
           find.descendant(of: group, matching: find.text(label)).last;
 
-      expect(readTheme().liquidGlass, LiquidGlassMode.none);
+      expect(readTheme().liquidGlass, LiquidGlassMode.ultra);
 
       await tester.tap(choice('Standard'));
       await tester.pumpAndSettle();

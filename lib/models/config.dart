@@ -613,7 +613,9 @@ abstract class ThemeProps with _$ThemeProps {
     @JsonKey(readValue: _readColorStyle)
     ColorStyle colorStyle,
     @Default(false) bool pureBlack,
-    @Default(LiquidGlassMode.none)
+    // vnxMATRIX: «жидкое стекло» на максимуме по умолчанию — это часть
+    // фирменного вида. Сохранённый выбор пользователя не трогается.
+    @Default(LiquidGlassMode.ultra)
     @JsonKey(readValue: _readLiquidGlass)
     LiquidGlassMode liquidGlass,
     @Default(TextScale()) TextScale textScale,
