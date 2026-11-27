@@ -142,8 +142,9 @@ for _ in $(seq 1 30); do [ -s "$OUT/http.log" ] && break; sleep 2; done
 summary ""
 summary "### Ядро"
 if [ -s "$OUT/http.log" ]; then
-  ua=$(python3 -c 'import json,sys; print(json.loads(open(sys.argv[1]).readline())["headers"].get("User-Agent",""))' "$OUT/http.log")
-  hdrs=$(python3 -c 'import json,sys; h=json.loads(open(sys.argv[1]).readline())["headers"]; print(", ".join(sorted(k for k in h if k.lower().startswith("x-"))))' "$OUT/http.log")
+  # Имена заголовков без учёта регистра: Dart шлёт их строчными (user-agent).
+  ua=$(python3 -c 'import json,sys; h={k.lower(): v for k, v in json.loads(open(sys.argv[1]).readline())["headers"].items()}; print(h.get("user-agent",""))' "$OUT/http.log")
+  hdrs=$(python3 -c 'import json,sys; h=json.loads(open(sys.argv[1]).readline())["headers"]; print(", ".join(sorted(k.lower() for k in h if k.lower().startswith("x-"))))' "$OUT/http.log")
   summary "- профиль скачан, User-Agent: \`$ua\`"
   summary "- заголовки устройства: ${hdrs:-нет}"
   # Панель выбирает формат по началу User-Agent (правило ^flclash → MIHOMO).
